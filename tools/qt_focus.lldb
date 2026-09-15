@@ -1,0 +1,9 @@
+expression -l objective-c++ -- @import AppKit
+expression -l objective-c++ -- @import ObjectiveC
+expression -l objective-c++ -- @import Darwin
+expression -l objective-c++ -- uintptr_t $arFocus = ({ uintptr_t arFocusValue = 0; Class arQNSClass = NSClassFromString(@"QNSView"); for (NSWindow *arWindow in NSApp.windows) { NSView *arView = arWindow.contentView; if (arWindow.isVisible && [arView isKindOfClass:arQNSClass]) arFocusValue = (uintptr_t)((void *(*)(id, SEL))objc_msgSend)(arView, sel_getUid("focusObject")); } arFocusValue; })
+expression -l objective-c++ -f hex -- $arFocus
+expression -l objective-c++ -f hex -- *(uintptr_t *)$arFocus
+expression -l objective-c++ -f hex -- *(uintptr_t *)(*(uintptr_t *)$arFocus)
+disassemble --start-address `*(uintptr_t *)(*(uintptr_t *)$arFocus)` --count 18
+process detach

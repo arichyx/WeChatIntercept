@@ -1,0 +1,4 @@
+expression -l objective-c++ -- @import AppKit
+expression -l objective-c++ -- @import ObjectiveC
+expression -l objective-c++ -O -- ({ NSMutableString *arResult = [NSMutableString string]; Class arClass = NSClassFromString(@"QNSView"); unsigned arCount = 0; Ivar *arIvars = class_copyIvarList(arClass, &arCount); for (unsigned arIndex = 0; arIndex < arCount; arIndex++) [arResult appendFormat:@"ivar %s %s offset=%td\n", ivar_getName(arIvars[arIndex]), ivar_getTypeEncoding(arIvars[arIndex]), ivar_getOffset(arIvars[arIndex])]; free(arIvars); Method *arMethods = class_copyMethodList(arClass, &arCount); for (unsigned arIndex = 0; arIndex < arCount; arIndex++) [arResult appendFormat:@"method %s %s\n", sel_getName(method_getName(arMethods[arIndex])), method_getTypeEncoding(arMethods[arIndex])]; free(arMethods); arResult; })
+process detach

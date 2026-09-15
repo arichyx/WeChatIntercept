@@ -2,15 +2,25 @@
 # 微信防撤回一键安装脚本
 # 适用：微信 4.1.x (Apple Silicon + Intel)
 # 依赖：clang / codesign / python3 (macOS 自带)
-# 用法：./patch.sh [--monitor-install|--uninstall|--debug|--help]
+# 用法：./patch.sh [--install|--monitor-install|--uninstall|--debug|--help]
 # 详细原理 / 版本适配指南见 doc/reverse-engineering-guide.md
 
 set -e
+set -E
+set -o pipefail
 
 WECHAT_APP="/Applications/WeChat.app"
 WECHAT_BIN="$WECHAT_APP/Contents/MacOS/WeChat"
 DYLIB_DST="$WECHAT_APP/Contents/Resources/WeChatAntiRevoke.dylib"
 DYLIB_INSTALL_NAME="@executable_path/../Resources/WeChatAntiRevoke.dylib"
+STATE_DIR="$HOME/Library/Application Support/WeChatIntercept"
+ORIGINAL_APP="$STATE_DIR/WeChat.original.app"
+ORIGINAL_BIN="$STATE_DIR/WeChat.original"
+ORIGINAL_VERSION_FILE="$STATE_DIR/WeChat.original.version"
+HOOK_LOG="$HOME/Library/Containers/com.tencent.xinWeChat/Data/Library/Logs/WeChatIntercept/hook.log"
+INSTALL_SWAPPED=0
+INSTALL_PREVIOUS_APP=""
+INSTALL_LIVE_APP="$WECHAT_APP"
 
 print_banner() {
     echo ""
@@ -62,7 +72,238 @@ kill_wechat() {
         echo "[INFO] 关闭微信..."
         killall WeChat 2>/dev/null || true
         sleep 2
+        if pgrep -x WeChat >/dev/null 2>&1; then
+            echo "[WARN] 微信未响应，强制结束残留进程..."
+            killall -KILL WeChat 2>/dev/null || true
+            sleep 1
+        fi
     fi
+}
+
+has_injected_load_command() {
+    otool -l "$WECHAT_BIN" 2>/dev/null | grep -F "WeChatAntiRevoke" >/dev/null
+}
+
+# patch.sh 的动态库注入只增加了一个 LC_LOAD_DYLIB。删除 dylib 文件本身
+# 是不够的，必须同步删除这个命令，否则 dyld 会在启动阶段报 Library missing。
+remove_injected_load_command() {
+    if [ ! -f "$WECHAT_BIN" ]; then
+        return 0
+    fi
+
+    if ! has_injected_load_command; then
+        echo "[INFO] 主程序没有 WeChatAntiRevoke 注入"
+        return 0
+    fi
+
+    echo "[INFO] 移除主程序中的 WeChatAntiRevoke 加载命令..."
+    python3 - "$WECHAT_BIN" <<'REMOVE_INJECTED_LOAD_COMMAND'
+import struct
+import sys
+
+path = sys.argv[1]
+TARGET = b"@executable_path/../Resources/WeChatAntiRevoke.dylib"
+FAT_MAGIC = 0xCAFEBABE
+MH_MAGIC = 0xFEEDFACE
+MH_MAGIC_64 = 0xFEEDFACF
+LC_LOAD_DYLIB = 0xC
+
+def read_u32(f, offset):
+    f.seek(offset)
+    raw = f.read(4)
+    if len(raw) != 4:
+        raise RuntimeError("读取 Mach-O 头失败")
+    return struct.unpack("<I", raw)[0]
+
+with open(path, "r+b") as f:
+    f.seek(0)
+    magic = struct.unpack(">I", f.read(4))[0]
+    if magic == FAT_MAGIC:
+        narch = struct.unpack(">I", f.read(4))[0]
+        slices = []
+        for _ in range(narch):
+            raw = f.read(20)
+            if len(raw) != 20:
+                raise RuntimeError("读取 Universal Mach-O 架构表失败")
+            _cpu, _sub, offset, size, _align = struct.unpack(">IIIII", raw)
+            slices.append((offset, size))
+    elif magic in (MH_MAGIC, MH_MAGIC_64):
+        f.seek(0, 2)
+        slices = [(0, f.tell())]
+    else:
+        raise RuntimeError("不是支持的 Mach-O 文件")
+
+    targets = []
+    for slice_offset, _slice_size in slices:
+        f.seek(slice_offset)
+        slice_magic = f.read(4)
+        if slice_magic == b"\xcf\xfa\xed\xfe":
+            header_size = 32
+        elif slice_magic == b"\xce\xfa\xed\xfe":
+            header_size = 28
+        else:
+            continue
+
+        ncmds = read_u32(f, slice_offset + 16)
+        sizeofcmds = read_u32(f, slice_offset + 20)
+        command_start = slice_offset + header_size
+        f.seek(command_start)
+        commands = f.read(sizeofcmds)
+        if len(commands) != sizeofcmds:
+            raise RuntimeError("读取 Mach-O load commands 失败")
+
+        pos = 0
+        found = []
+        for index in range(ncmds):
+            if pos + 8 > sizeofcmds:
+                raise RuntimeError("Mach-O load commands 越界")
+            cmd, cmdsize = struct.unpack_from("<II", commands, pos)
+            if cmdsize < 8 or pos + cmdsize > sizeofcmds:
+                raise RuntimeError("Mach-O load command 大小非法")
+
+            if cmd == LC_LOAD_DYLIB and cmdsize >= 24:
+                name_offset = struct.unpack_from("<I", commands, pos + 8)[0]
+                if 24 <= name_offset < cmdsize:
+                    name = commands[pos + name_offset:pos + cmdsize].split(b"\0", 1)[0]
+                    if name == TARGET:
+                        found.append((index, pos, cmdsize))
+            pos += cmdsize
+
+        if len(found) > 1:
+            raise RuntimeError("同一架构发现多个 WeChatAntiRevoke 加载命令，拒绝自动修改")
+        if found:
+            _index, command_pos, command_size = found[0]
+            targets.append((slice_offset, command_start, ncmds, sizeofcmds,
+                            commands, command_pos, command_size))
+
+    if not targets:
+        raise RuntimeError("没有找到可移除的 WeChatAntiRevoke 加载命令")
+
+    for slice_offset, command_start, ncmds, sizeofcmds, commands, command_pos, command_size in targets:
+        new_commands = commands[:command_pos] + commands[command_pos + command_size:]
+        f.seek(command_start)
+        f.write(new_commands)
+        f.write(b"\0" * command_size)
+        f.seek(slice_offset + 16)
+        f.write(struct.pack("<I", ncmds - 1))
+        f.seek(slice_offset + 20)
+        f.write(struct.pack("<I", sizeofcmds - command_size))
+
+print("ok")
+REMOVE_INJECTED_LOAD_COMMAND
+}
+
+backup_original_app() {
+    local current_version="${VERSION:-unknown}"
+    local saved_version=""
+    if [ -f "$ORIGINAL_VERSION_FILE" ]; then
+        read -r saved_version < "$ORIGINAL_VERSION_FILE" || true
+    fi
+
+    mkdir -p "$STATE_DIR"
+    if [ -d "$ORIGINAL_APP" ] && [ "$saved_version" = "$current_version" ]; then
+        codesign --verify --deep --strict "$ORIGINAL_APP"
+        echo "[INFO] 使用已有微信整包备份: $ORIGINAL_APP"
+        return 0
+    fi
+
+    # 已经是旧插件现场却没有整包备份时，不能把带补丁的 app 当作原始备份。
+    if [ -f "$DYLIB_DST" ] || has_injected_load_command; then
+        echo "[ERROR] 当前微信已被修改，但没有同版本的整包原始备份"
+        echo "        请先用未修改的微信副本恢复后再安装"
+        return 1
+    fi
+
+    local tmp_dir
+    if [ -e "$ORIGINAL_APP" ]; then
+        echo "[ERROR] 原始备份路径已存在但版本记录不一致，拒绝覆盖: $ORIGINAL_APP"
+        return 1
+    fi
+    tmp_dir=$(mktemp -d "$STATE_DIR/.wechat-backup.XXXXXX")
+    codesign --verify --deep --strict "$WECHAT_APP"
+    if ! ditto --rsrc --extattr --acl "$WECHAT_APP" "$tmp_dir/WeChat.original.app"; then
+        echo "[ERROR] 保存微信整包备份失败"
+        return 1
+    fi
+    codesign --verify --deep --strict "$tmp_dir/WeChat.original.app"
+    mv "$tmp_dir/WeChat.original.app" "$ORIGINAL_APP"
+    rmdir "$tmp_dir"
+    printf '%s\n' "$current_version" > "$ORIGINAL_VERSION_FILE"
+    echo "[INFO] 已保存微信整包备份: $ORIGINAL_APP"
+}
+
+restore_original_app() {
+    if [ ! -d "$ORIGINAL_APP" ]; then
+        return 1
+    fi
+
+    local current_version="${VERSION:-unknown}"
+    local saved_version=""
+    if [ -f "$ORIGINAL_VERSION_FILE" ]; then
+        read -r saved_version < "$ORIGINAL_VERSION_FILE" || true
+    fi
+    if [ "$saved_version" != "$current_version" ]; then
+        echo "[WARN] 微信版本与整包备份不一致，跳过整包恢复"
+        return 1
+    fi
+
+    codesign --verify --deep --strict "$ORIGINAL_APP" || return 1
+
+    local rescue_dir
+    rescue_dir=$(mktemp -d /private/tmp/WeChatIntercept-restore.XXXXXX)
+    if [ -d "$WECHAT_APP" ]; then
+        mv "$WECHAT_APP" "$rescue_dir/WeChat.before-restore.app"
+    fi
+    if ! ditto --rsrc --extattr --acl "$ORIGINAL_APP" "$WECHAT_APP"; then
+        echo "[ERROR] 恢复微信整包失败，尝试放回当前 app"
+        rm -rf "$WECHAT_APP" 2>/dev/null || true
+        if [ -d "$rescue_dir/WeChat.before-restore.app" ]; then
+            mv "$rescue_dir/WeChat.before-restore.app" "$WECHAT_APP"
+        fi
+        return 1
+    fi
+    echo "[INFO] 已恢复微信整包原始副本"
+    echo "[INFO] 修改前副本保留在: $rescue_dir/WeChat.before-restore.app"
+}
+
+backup_original_binary() {
+    local current_version="${VERSION:-unknown}"
+    local saved_version=""
+    if [ -f "$ORIGINAL_VERSION_FILE" ]; then
+        read -r saved_version < "$ORIGINAL_VERSION_FILE" || true
+    fi
+
+    mkdir -p "$STATE_DIR"
+    if [ ! -f "$ORIGINAL_BIN" ] || [ "$saved_version" != "$current_version" ]; then
+        if otool -l "$WECHAT_BIN" 2>/dev/null | grep -F "WeChatAntiRevoke" >/dev/null; then
+            echo "[ERROR] 备份前仍检测到动态库注入"
+            return 1
+        fi
+        cp -p "$WECHAT_BIN" "$ORIGINAL_BIN"
+        printf '%s\n' "$current_version" > "$ORIGINAL_VERSION_FILE"
+        echo "[INFO] 已保存微信主程序备份: $ORIGINAL_BIN"
+    else
+        echo "[INFO] 使用已有微信主程序备份: $ORIGINAL_BIN"
+    fi
+}
+
+restore_original_binary() {
+    if [ ! -f "$ORIGINAL_BIN" ]; then
+        return 1
+    fi
+
+    local current_version="${VERSION:-unknown}"
+    local saved_version=""
+    if [ -f "$ORIGINAL_VERSION_FILE" ]; then
+        read -r saved_version < "$ORIGINAL_VERSION_FILE" || true
+    fi
+    if [ "$saved_version" != "$current_version" ]; then
+        echo "[WARN] 微信版本与备份不一致，跳过主程序恢复"
+        return 1
+    fi
+
+    cp -p "$ORIGINAL_BIN" "$WECHAT_BIN"
+    echo "[INFO] 已恢复微信主程序备份"
 }
 
 remove_provenance() {
@@ -75,10 +316,14 @@ remove_provenance() {
 
     # 递归清除残留 xattr（best-effort）
     xattr -cr "$WECHAT_APP" 2>/dev/null || true
-    sudo xattr -cr "$WECHAT_APP" 2>/dev/null || true
+    # 不要在脚本中无条件调用 sudo：没有缓存凭据时会卡在密码提示，且
+    # provenance 可能被系统重新附加；重签名阶段的 entitlements 才是实际兜底。
+    if ! sudo -n xattr -cr "$WECHAT_APP" 2>/dev/null; then
+        echo "[INFO] 没有可用的免交互 sudo 权限，跳过 root 级 xattr 清理"
+    fi
 
     # 检查结果（仅警告，不阻断安装）
-    if xattr "$WECHAT_APP" 2>/dev/null | grep -q "com.apple.provenance"; then
+    if xattr "$WECHAT_APP" 2>/dev/null | grep -F "com.apple.provenance" >/dev/null; then
         echo "[WARN] provenance 未能完全清除（macOS Sequoia 可能会自动重新附加）"
         echo "[INFO] 将通过 entitlements 绕过此限制"
     else
@@ -89,647 +334,13 @@ remove_provenance() {
 compile_dylib() {
     echo "[INFO] 编译 hook 动态库..."
 
-    # 内嵌 hook.m 源码
-    local SRC_FILE="/tmp/antirevoke_hook_src.m"
-    rm -f "$SRC_FILE"
-    cat > "$SRC_FILE" << 'HOOK_SOURCE'
-#import <Foundation/Foundation.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach/mach.h>
-#import <sys/mman.h>
-#import <libkern/OSCacheControl.h>
-#import <stdint.h>
-#import <string.h>
-#import <stdio.h>
-#import <sys/stat.h>
+    local SRC_FILE
+    SRC_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hook.m"
 
-static FILE *g_logFile = NULL;
-
-static void log_open(void) {
-    g_logFile = fopen("/tmp/antirevoke_debug.log", "w");
-}
-
-#define ARLOG(fmt, ...) do { \
-    if (g_logFile) { fprintf(g_logFile, "[AntiRevoke] " fmt "\n", ##__VA_ARGS__); fflush(g_logFile); } \
-} while(0)
-
-// 注意：Resources/wechat.dylib 是核心库（~140MB），Frameworks/ 下是 stub（~16KB），不能 hook 错
-static const char    *kDylibSuffix_Resources  = "Resources/wechat.dylib";
-static const char    *kDylibSuffix_Frameworks = "Frameworks/wechat.dylib";
-static const int32_t  kRevokeType    = 0x2712;   // isRevokeMessage 比较的 MsgType 常量
-
-
-
-// 已知 build 的硬编码地址（特征码搜索失败时的兜底）
-static const uintptr_t k419_SlotVA_arm64   = 0x9301838;
-static const uintptr_t k4110_FuncVA_arm64  = 0x44FFE20;
-static const uintptr_t k4110_FuncVA_x86_64 = 0x4B4E9A0;
-static const uintptr_t k419_FuncVA_x86_64  = 0x4AF08D0;
-
-// 当前登录用户 wxid，用于区分"自己撤回"vs"对方撤回"
-static char g_my_id[64] = {0};
-static _Bool g_my_id_loaded = 0;
-
-// 通过取 ~/Library/Containers/.../app_data/login/ 下最新修改的目录名判定
-static void load_my_user_id(void) {
-    if (g_my_id_loaded) return;
-    g_my_id_loaded = 1;
-
-    const char *home = getenv("HOME");
-    if (!home) return;
-
-    char loginDir[1024];
-    snprintf(loginDir, sizeof(loginDir),
-        "%s/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/login", home);
-
-    @autoreleasepool {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *dirPath = [NSString stringWithUTF8String:loginDir];
-        NSArray *contents = [fm contentsOfDirectoryAtPath:dirPath error:nil];
-        if (!contents || [contents count] == 0) return;
-
-        NSString *latestName = nil;
-        NSDate *latestDate = nil;
-
-        for (NSString *name in contents) {
-            if ([name hasPrefix:@"."]) continue;
-            NSString *fullPath = [dirPath stringByAppendingPathComponent:name];
-            BOOL isDir = NO;
-            if (![fm fileExistsAtPath:fullPath isDirectory:&isDir] || !isDir) continue;
-
-            NSString *keyInfo = [fullPath stringByAppendingPathComponent:@"key_info.dat"];
-            NSDictionary *attrs = [fm fileExistsAtPath:keyInfo]
-                ? [fm attributesOfItemAtPath:keyInfo error:nil]
-                : [fm attributesOfItemAtPath:fullPath error:nil];
-            NSDate *modDate = attrs[NSFileModificationDate];
-
-            if (!latestDate || (modDate && [modDate compare:latestDate] == NSOrderedDescending)) {
-                latestDate = modDate;
-                latestName = name;
-            }
-        }
-
-        if (latestName && [latestName length] >= 3 && [latestName length] < sizeof(g_my_id)) {
-            strncpy(g_my_id, [latestName UTF8String], sizeof(g_my_id) - 1);
-            ARLOG("用户: %s", g_my_id);
-        }
-    }
-}
-
-
-
-static void send_notification(const char *text) {
-    // osascript 对 " 和 \ 敏感，必须转义
-    char *escaped = (char *)malloc(1024);
-    if (!escaped) return;
-    int j = 0;
-    for (int i = 0; text[i] && j < 1022; i++) {
-        if (text[i] == '"' || text[i] == '\\') escaped[j++] = '\\';
-        escaped[j++] = text[i];
-    }
-    escaped[j] = '\0';
-
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        FILE *sf = fopen("/tmp/antirevoke_notify.scpt", "w");
-        if (sf) {
-            fprintf(sf, "display notification \"%s\" with title \"WeChatIntercept\"\n", escaped);
-            fclose(sf);
-            system("osascript /tmp/antirevoke_notify.scpt");
-        }
-        free(escaped);
-    });
-}
-
-// 微信小版本升级 sender 偏移可能漂移；仅检查前 4 字节是否可打印 ASCII
-// 失效时静默放行（return 1），不影响微信内部撤回流程；阈值后弹一次催更新通知
-static _Bool is_valid_sender(const char *s) {
-    if (s[0] == '\0') return 1;  // 空 = 自己撤回的内部回调
-    for (int i = 0; i < 4; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (c < 0x20 || c > 0x7E) return 0;
-    }
-    return 1;
-}
-
-// 入口：被微信 isRevokeMessage 替换。
-// 返回 1 = 该消息是撤回（按原行为处理）；返回 0 = 阻止微信删除消息
-__attribute__((visibility("default")))
-_Bool hook_isRevokeMessage(void *msg) {
-    if (msg == NULL) return 0;
-
-    int32_t msgType = *(int32_t *)((uint8_t *)msg + 0x0C);
-    if (msgType != kRevokeType) return 0;
-
-    load_my_user_id();
-
-    // 动态寻址 sender 字符串：+0x18 在新 build 中可能是标记字节
-    // 从 +0x18 开始搜第一个可打印 C 字符串
-    int sender_off = 0x18;
-    {
-        int found = 0;
-        for (int off = 0x18; off <= 0x20; off++) {
-            const unsigned char *p = (const unsigned char *)msg + off;
-            if (p[0] >= 0x20 && p[0] <= 0x7E &&
-                p[1] >= 0x20 && p[1] <= 0x7E &&
-                p[2] >= 0x20 && p[2] <= 0x7E) {
-                sender_off = off;
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            // 极端 fallback 仍然用 +0x18
-            sender_off = 0x18;
-        }
-    }
-    const char *sender = (const char *)((uint8_t *)msg + sender_off);
-
-    if (!is_valid_sender(sender)) {
-        ARLOG("WARN: sender 区域非可打印 ASCII，跳过此次调用");
-        static int g_invalid_count = 0;
-        static _Bool g_warned = 0;
-        g_invalid_count++;
-        if (g_invalid_count >= 5 && !g_warned) {
-            g_warned = 1;
-            char *cmd = (char *)malloc(1024);
-            if (cmd) {
-                snprintf(cmd, 1024,
-                    "osascript -e 'display notification \"sender 偏移已失效，快去催 WeChatIntercept 作者更新适配\" "
-                    "with title \"WeChatIntercept 需更新\"' &");
-                dispatch_async(dispatch_get_global_queue(0, 0), ^{
-                    system(cmd);
-                    free(cmd);
-                });
-            }
-        }
-        return 1;
-    }
-
-    // 自己撤回 → 放行（让微信正常处理）
-    if (sender[0] == '\0') return 1;
-    if (g_my_id[0] != '\0' && strncmp(sender, g_my_id, strlen(g_my_id)) == 0) return 1;
-
-    // 对方撤回 → 阻止
-    ARLOG("拦截: %.20s", sender);
-
-    // 从 msg+0x130 (ptr) / +0x138 (len) 读撤回 XML
-    char notify_text[256] = {0};
-
-#if defined(__arm64__) || defined(__aarch64__)
-    uint64_t xml_ptr = *(uint64_t *)((uint8_t *)msg + 0x130);
-    uint64_t xml_len = *(uint64_t *)((uint8_t *)msg + 0x138);
-    if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
-        // CDATA 内容形如 "Macanzy" 撤回了一条消息
-        const char *xml_body = (const char *)xml_ptr;
-        const char *cs = strstr(xml_body, "<![CDATA[");
-        const char *ce = cs ? strstr(cs, "]]>") : NULL;
-        if (cs && ce) {
-            cs += 9;
-            size_t len = ce - cs;
-            if (len > 0 && len < sizeof(notify_text) - 1) {
-                memcpy(notify_text, cs, len);
-                notify_text[len] = '\0';
-            }
-        }
-    }
-#endif
-
-    // 反查 lldb monitor 写入的消息缓存（/tmp/wechat_msg_cache.tsv）
-    char orig_content[512] = {0};
-    _Bool has_orig = 0;
-#if defined(__arm64__) || defined(__aarch64__)
-    if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
-        const char *xml_body = (const char *)xml_ptr;
-        const char *p = strstr(xml_body, "<newmsgid>");
-        uint64_t newmsgid = 0;
-        if (p) {
-            p += 10;
-            int digits = 0;
-            while (*p >= '0' && *p <= '9' && digits < 20) {
-                newmsgid = newmsgid * 10 + (uint64_t)(*p - '0');
-                p++; digits++;
-            }
-            if (digits == 0) newmsgid = 0;
-        }
-        if (newmsgid != 0) {
-            FILE *cf = fopen("/tmp/wechat_msg_cache.tsv", "r");
-            if (cf) {
-                char line[1024];
-                while (fgets(line, sizeof(line), cf)) {
-                    char *t1 = strchr(line, '\t');
-                    if (!t1) continue;
-                    *t1 = '\0';
-                    uint64_t row_svrid = 0;
-                    int d2 = 0;
-                    for (const char *q = line; *q >= '0' && *q <= '9' && d2 < 20; q++, d2++)
-                        row_svrid = row_svrid * 10 + (uint64_t)(*q - '0');
-                    if (d2 == 0 || row_svrid != newmsgid) continue;
-                    char *t2 = strchr(t1 + 1, '\t');
-                    if (!t2) continue;
-                    char *nl = strchr(t2 + 1, '\n');
-                    if (nl) *nl = '\0';
-                    strncpy(orig_content, t2 + 1, sizeof(orig_content) - 1);
-                    has_orig = (orig_content[0] != '\0');
-                }
-                fclose(cf);
-            }
-            ARLOG("撤回反查: svrid=%llu %s",
-                  (unsigned long long)newmsgid, has_orig ? "命中" : "未命中");
-        }
-    }
-#endif
-
-    // 非文本消息描述模板 → 占位符
-    if (has_orig) {
-        struct { const char *needle; const char *replace; } kReplaces[] = {
-            {"发了一张图片", "[图片]"}, {"发了一段视频", "[视频]"},
-            {"发了一个文件", "[文件]"}, {"发了一段语音", "[语音]"},
-            {"发了一条语音消息", "[语音]"}, {"发了一个表情", "[表情]"},
-            {"发了一个视频号", "[视频号]"}, {"发了一张名片", "[名片]"},
-            {"发了一个位置", "[位置]"}, {"发了一个红包", "[红包]"},
-            {"发了一个链接", "[链接]"}, {"发了一个小程序", "[小程序]"},
-            {NULL, NULL},
-        };
-        for (int i = 0; kReplaces[i].needle; i++) {
-            if (strstr(orig_content, kReplaces[i].needle)) {
-                strncpy(orig_content, kReplaces[i].replace, sizeof(orig_content) - 1);
-                break;
-            }
-        }
-    }
-
-    // 从 notify_text 抽纯昵称：剥 "撤回了" 后缀 + 首尾空格 + 英文双引号
-    char nick[128] = {0};
-    if (notify_text[0] != '\0') {
-        const char *p = strstr(notify_text, "撤回了");
-        if (p && p > notify_text) {
-            const char *start = notify_text;
-            size_t nlen = (size_t)(p - notify_text);
-            while (nlen > 0 && start[nlen - 1] == ' ') nlen--;
-            while (nlen > 0 && *start == ' ') { start++; nlen--; }
-            if (nlen >= 2 && start[0] == '"' && start[nlen - 1] == '"') { start++; nlen -= 2; }
-            if (nlen > 0 && nlen < sizeof(nick)) { memcpy(nick, start, nlen); nick[nlen] = '\0'; }
-        }
-    }
-    const char *who = (nick[0] != '\0') ? nick : sender;
-
-    char content[768] = {0};
-    if (has_orig) {
-        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息：%s", who, orig_content);
-    } else {
-        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息", who);
-    }
-
-    send_notification(content);
-
-    return 0;
-}
-
-// ── 查找 wechat.dylib 的 ASLR slide 和 mach_header ───────────
-// 优先匹配 Resources/wechat.dylib（核心库），Frameworks/ 为 stub 不可用
-static uintptr_t find_wechat_slide(const struct mach_header **out_header) {
-    uint32_t count = _dyld_image_count();
-    uintptr_t fallback = 0;
-    const struct mach_header *fallback_header = NULL;
-    size_t resLen = strlen(kDylibSuffix_Resources);
-    size_t fwLen  = strlen(kDylibSuffix_Frameworks);
-
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (!name) continue;
-        size_t len = strlen(name);
-        if (len >= resLen && strcmp(name + len - resLen, kDylibSuffix_Resources) == 0) {
-            if (out_header) *out_header = _dyld_get_image_header(i);
-            return (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-        }
-        if (len >= fwLen && strcmp(name + len - fwLen, kDylibSuffix_Frameworks) == 0) {
-            fallback = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-            fallback_header = _dyld_get_image_header(i);
-        }
-    }
-    if (out_header) *out_header = fallback_header;
-    return fallback;
-}
-
-static _Bool find_text_segment(const struct mach_header *header, uintptr_t slide,
-                                uintptr_t *out_start, size_t *out_size) {
-    if (!header) return 0;
-
-    const uint8_t *p = (const uint8_t *)header;
-    uint32_t ncmds;
-    if (header->magic == MH_MAGIC_64) {
-        p += sizeof(struct mach_header_64);
-        ncmds = ((const struct mach_header_64 *)header)->ncmds;
-    } else if (header->magic == MH_MAGIC) {
-        p += sizeof(struct mach_header);
-        ncmds = header->ncmds;
-    } else {
-        return 0;
-    }
-
-    for (uint32_t i = 0; i < ncmds; i++) {
-        const struct load_command *lc = (const struct load_command *)p;
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *seg = (const struct segment_command_64 *)p;
-            if (strcmp(seg->segname, "__TEXT") == 0) {
-                *out_start = (uintptr_t)seg->vmaddr + slide;
-                *out_size = (size_t)seg->vmsize;
-                return 1;
-            }
-        } else if (lc->cmd == LC_SEGMENT) {
-            const struct segment_command *seg = (const struct segment_command *)p;
-            if (strcmp(seg->segname, "__TEXT") == 0) {
-                *out_start = (uintptr_t)seg->vmaddr + slide;
-                *out_size = (size_t)seg->vmsize;
-                return 1;
-            }
-        }
-        p += lc->cmdsize;
-    }
-    return 0;
-}
-
-// arm64 isRevokeMessage 特征码：LDR W8,[X0,#C]; MOV W9,#0x2712; CMP; CSET; RET
-static uintptr_t scan_isRevokeMessage_arm64(uintptr_t text_start, size_t text_size) {
-    static const uint32_t pattern[5] = {
-        0xB9400C08u, 0x5284E249u, 0x6B09011Fu, 0x1A9F17E0u, 0xD65F03C0u
-    };
-    const uint32_t *base = (const uint32_t *)text_start;
-    size_t count = text_size / 4;
-    if (count < 5) return 0;
-
-    for (size_t i = 0; i + 5 <= count; i++) {
-        if (base[i]   == pattern[0] &&
-            base[i+1] == pattern[1] &&
-            base[i+2] == pattern[2] &&
-            base[i+3] == pattern[3] &&
-            base[i+4] == pattern[4]) {
-            return text_start + i * 4;
-        }
-    }
-    return 0;
-}
-
-// x86_64 isRevokeMessage 特征码
-static uintptr_t scan_isRevokeMessage_x86_64(uintptr_t text_start, size_t text_size) {
-    static const uint8_t pattern[] = {
-        0x55, 0x48, 0x89, 0xE5,
-        0x81, 0x7F, 0x0C, 0x12, 0x27, 0x00, 0x00,
-        0x0F, 0x94, 0xC0,
-        0x5D, 0xC3
-    };
-    const uint8_t *base = (const uint8_t *)text_start;
-    if (text_size < sizeof(pattern)) return 0;
-
-    for (size_t i = 0; i + sizeof(pattern) <= text_size; i++) {
-        if (base[i] == pattern[0] &&
-            memcmp(base + i, pattern, sizeof(pattern)) == 0) {
-            return text_start + i;
-        }
-    }
-    return 0;
-}
-
-static const char *kKnownBuilds[] = { "268602", "268824", NULL };
-
-static _Bool is_known_build(const char *build) {
-    if (!build) return 0;
-    for (int i = 0; kKnownBuilds[i]; i++) {
-        if (strcmp(build, kKnownBuilds[i]) == 0) return 1;
-    }
-    return 0;
-}
-
-static void read_wechat_version(char *short_ver, size_t short_sz,
-                                  char *build, size_t build_sz) {
-    short_ver[0] = '\0';
-    build[0] = '\0';
-    @autoreleasepool {
-        NSDictionary *info = [[NSBundle bundleWithPath:@"/Applications/WeChat.app"] infoDictionary];
-        NSString *sv = info[@"CFBundleShortVersionString"];
-        NSString *bv = info[@"CFBundleVersion"];
-        if (sv) strncpy(short_ver, [sv UTF8String], short_sz - 1);
-        if (bv) strncpy(build, [bv UTF8String], build_sz - 1);
-    }
-}
-
-static kern_return_t make_rw(uintptr_t addr, size_t len) {
-    uintptr_t page = addr & ~(uintptr_t)0x3FFF;
-    size_t sz = (addr + len - page + 0x3FFF) & ~(size_t)0x3FFF;
-    return vm_protect(mach_task_self(), (vm_address_t)page, sz, 0,
-                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-}
-static kern_return_t make_rx(uintptr_t addr, size_t len) {
-    uintptr_t page = addr & ~(uintptr_t)0x3FFF;
-    size_t sz = (addr + len - page + 0x3FFF) & ~(size_t)0x3FFF;
-    return vm_protect(mach_task_self(), (vm_address_t)page, sz, 0,
-                      VM_PROT_READ | VM_PROT_EXECUTE);
-}
-
-// arm64: LDR X16,#8; BR X16; <addr64>; NOP  — 共 20 字节覆盖原函数入口
-static _Bool install_arm64_trampoline(uintptr_t func_addr, uintptr_t hook_addr) {
-    kern_return_t kr = make_rw(func_addr, 20);
-    if (kr != KERN_SUCCESS) { ARLOG("ERROR: make_rw kr=%d", kr); return 0; }
-
-    uint32_t *p = (uint32_t *)func_addr;
-    p[0] = 0x58000050u;  // LDR X16, #8
-    p[1] = 0xD61F0200u;  // BR X16
-    *(uint64_t *)(func_addr + 8) = (uint64_t)hook_addr;
-    p[4] = 0xD503201Fu;  // NOP
-
-    // 回读验证
-    if (*(volatile uint32_t *)func_addr != 0x58000050u) {
-        ARLOG("ERROR: 写入验证失败"); return 0;
-    }
-
-    sys_icache_invalidate((void *)func_addr, 20);
-    make_rx(func_addr, 20);
-    return 1;
-}
-
-// x86_64: JMP [RIP+0]; <addr64>; NOP; RET  — 共 16 字节
-static _Bool install_x86_64_trampoline(uintptr_t func_addr, uintptr_t hook_addr) {
-    kern_return_t kr = make_rw(func_addr, 16);
-    if (kr != KERN_SUCCESS) { ARLOG("ERROR: x86_64 make_rw kr=%d", kr); return 0; }
-
-    uint8_t *p = (uint8_t *)func_addr;
-    p[0] = 0xFF; p[1] = 0x25;  // JMP [RIP+0]
-    p[2] = p[3] = p[4] = p[5] = 0x00;
-    *(uint64_t *)(func_addr + 6) = (uint64_t)hook_addr;
-    p[14] = 0x90; p[15] = 0xC3;
-
-    if (*(volatile uint8_t *)func_addr != 0xFF) {
-        ARLOG("ERROR: x86_64 写入验证失败"); return 0;
-    }
-
-    __builtin___clear_cache((char *)func_addr, (char *)(func_addr + 16));
-    make_rx(func_addr, 16);
-    return 1;
-}
-
-static void notify_install_failed(const char *short_ver, const char *build, _Bool known_build) {
-
-    char *cmd = (char *)malloc(2048);
-    if (!cmd) return;
-
-    char title[64];
-    char body[512];
-
-    if (known_build) {
-        snprintf(title, sizeof(title), "WeChatIntercept 异常");
-        snprintf(body, sizeof(body),
-            "已知版本 %s (%s) hook 安装失败，请查看 /tmp/antirevoke_debug.log",
-            short_ver, build);
-    } else {
-        snprintf(title, sizeof(title), "WeChatIntercept 需更新");
-        snprintf(body, sizeof(body),
-            "微信版本 %s (build %s) 未适配，防撤回功能已失效。请前往 GitHub 获取最新脚本",
-            short_ver, build);
-    }
-
-    char escaped[1024];
-    int j = 0;
-    for (int i = 0; body[i] && j < (int)sizeof(escaped) - 2; i++) {
-        if (body[i] == '"' || body[i] == '\\') escaped[j++] = '\\';
-        escaped[j++] = body[i];
-    }
-    escaped[j] = '\0';
-
-    snprintf(cmd, 2048,
-        "osascript -e 'display notification \"%s\" with title \"%s\"' &",
-        escaped, title);
-
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        system(cmd);
-        free(cmd);
-    });
-}
-
-// ── 主 constructor ───────────────────────────────────────────
-__attribute__((constructor))
-static void hook_init(void) {
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{
-
-        log_open();
-        ARLOG("hook_init 启动");
-
-        char short_ver[32] = {0};
-        char build[32] = {0};
-        read_wechat_version(short_ver, sizeof(short_ver), build, sizeof(build));
-        _Bool known_build = is_known_build(build);
-        ARLOG("微信版本: %s (build %s) %s", short_ver, build,
-              known_build ? "[已适配]" : "[未适配]");
-
-        const struct mach_header *header = NULL;
-        uintptr_t slide = find_wechat_slide(&header);
-        if (slide == 0) {
-            ARLOG("ERROR: 未找到 wechat.dylib");
-            notify_install_failed(short_ver, build, known_build);
-            return;
-        }
-
-        uintptr_t text_start = 0;
-        size_t text_size = 0;
-        _Bool has_text = find_text_segment(header, slide, &text_start, &text_size);
-        ARLOG("slide=0x%lx __TEXT=[0x%lx, +0x%zx) found=%d",
-              (unsigned long)slide, (unsigned long)text_start, text_size, has_text);
-
-        uintptr_t hook = (uintptr_t)&hook_isRevokeMessage;
-        _Bool installed = 0;
-
-#if defined(__arm64__) || defined(__aarch64__)
-        // 三级查找：硬编码快速路径 → 特征码搜索 → 4.1.9 slot fallback
-        uintptr_t func_addr = 0;
-        uintptr_t func_4110 = slide + k4110_FuncVA_arm64;
-        uint32_t head_insn = *(volatile uint32_t *)func_4110;
-
-        if (head_insn == 0xB9400C08u) {
-            uint32_t *p = (uint32_t *)func_4110;
-            if (p[1] == 0x5284E249u && p[2] == 0x6B09011Fu &&
-                p[3] == 0x1A9F17E0u && p[4] == 0xD65F03C0u) {
-                func_addr = func_4110;
-                ARLOG("快速路径命中: 0x%lx", (unsigned long)func_addr);
-            }
-        }
-
-        if (func_addr == 0 && has_text) {
-            ARLOG("快速路径未命中，开始特征码搜索...");
-            uintptr_t found = scan_isRevokeMessage_arm64(text_start, text_size);
-            if (found) {
-                func_addr = found;
-                ARLOG("特征码搜索找到: 0x%lx (offset 0x%lx)",
-                      (unsigned long)func_addr, (unsigned long)(func_addr - slide));
-            }
-        }
-
-        if (func_addr != 0) {
-            if (install_arm64_trampoline(func_addr, hook)) {
-                ARLOG("arm64 trampoline 安装成功");
-                installed = 1;
-            }
-        } else {
-            // 4.1.9 slot fallback
-            void **slot = (void **)(slide + k419_SlotVA_arm64);
-            uintptr_t page = (uintptr_t)slot & ~(uintptr_t)0x3FFF;
-            kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000,
-                                          0, VM_PROT_READ | VM_PROT_WRITE);
-            if (kr == KERN_SUCCESS) {
-                *slot = (void *)hook;
-                ARLOG("4.1.9 arm64 slot 写入（fallback）");
-                installed = 1;
-            }
-        }
-
-#elif defined(__x86_64__)
-        uintptr_t func_addr = 0;
-        uintptr_t func_4110_x86 = slide + k4110_FuncVA_x86_64;
-        uintptr_t func_419_x86  = slide + k419_FuncVA_x86_64;
-        const uint32_t kFuncHead = 0xE5894855u;
-
-        if (*(volatile uint32_t *)func_4110_x86 == kFuncHead) {
-            func_addr = func_4110_x86;
-        } else if (*(volatile uint32_t *)func_419_x86 == kFuncHead) {
-            func_addr = func_419_x86;
-        }
-
-        if (func_addr == 0 && has_text) {
-            ARLOG("快速路径未命中，开始特征码搜索...");
-            uintptr_t found = scan_isRevokeMessage_x86_64(text_start, text_size);
-            if (found) {
-                func_addr = found;
-                ARLOG("特征码搜索找到: 0x%lx (offset 0x%lx)",
-                      (unsigned long)func_addr, (unsigned long)(func_addr - slide));
-            }
-        }
-
-        if (func_addr != 0) {
-            if (install_x86_64_trampoline(func_addr, hook)) {
-                ARLOG("x86_64 trampoline 安装成功");
-                installed = 1;
-            }
-        }
-#endif
-
-        if (!installed) {
-            ARLOG("ERROR: hook 安装失败 - 微信版本 %s (build %s) 未适配",
-                  short_ver, build);
-            notify_install_failed(short_ver, build, known_build);
-        } else {
-            ARLOG("就绪，等待撤回消息...");
-        }
-    });
-}
-HOOK_SOURCE
-
-    clang -arch arm64 -arch x86_64 -shared -framework Foundation \
+    clang -arch arm64 -arch x86_64 -fobjc-arc -shared -framework Foundation -framework AppKit \
         -o "$DYLIB_DST" \
         -install_name "$DYLIB_INSTALL_NAME" \
         "$SRC_FILE" 2>&1
-
-    rm -f "$SRC_FILE"
 
     if [ ! -f "$DYLIB_DST" ]; then
         echo "[ERROR] 编译失败"
@@ -741,129 +352,160 @@ HOOK_SOURCE
 inject_dylib() {
     echo "[INFO] 注入动态库到微信..."
 
-    python3 << 'INJECT_SCRIPT'
+    python3 - "$WECHAT_BIN" << 'INJECT_SCRIPT'
 import struct
+import sys
 
-wechat_path = '/Applications/WeChat.app/Contents/MacOS/WeChat'
-dylib_name = b'@executable_path/../Resources/WeChatAntiRevoke.dylib\x00'
-while len(dylib_name) % 4 != 0:
+wechat_path = sys.argv[1]
+target_name = b'@executable_path/../Resources/WeChatAntiRevoke.dylib'
+dylib_name = target_name + b'\x00'
+while len(dylib_name) % 8 != 0:
     dylib_name += b'\x00'
 
 cmd_size = 24 + len(dylib_name)
-while cmd_size % 4 != 0:
+while cmd_size % 8 != 0:
     cmd_size += 1
     dylib_name += b'\x00'
 
 with open(wechat_path, 'r+b') as f:
     fat_magic = struct.unpack('>I', f.read(4))[0]
-    assert fat_magic == 0xCAFEBABE
+    if fat_magic != 0xCAFEBABE:
+        raise RuntimeError('仅支持 Universal Mach-O 微信主程序')
     narch = struct.unpack('>I', f.read(4))[0]
 
     slices = []
-    for i in range(narch):
-        cpu = struct.unpack('>I', f.read(4))[0]
-        sub = struct.unpack('>I', f.read(4))[0]
-        offset = struct.unpack('>I', f.read(4))[0]
-        size = struct.unpack('>I', f.read(4))[0]
-        align = struct.unpack('>I', f.read(4))[0]
+    for _ in range(narch):
+        cpu, sub, offset, size, align = struct.unpack('>IIIII', f.read(20))
         slices.append((cpu, offset, size))
 
-    for cpu, slice_offset, size in slices:
+    plans = []
+    for cpu, slice_offset, slice_size in slices:
         f.seek(slice_offset)
-        magic = struct.unpack('<I', f.read(4))[0]
-        if magic != 0xFEEDFACF:
+        magic = f.read(4)
+        if magic != b'\xcf\xfa\xed\xfe':
             continue
-        f.read(12)
-        ncmds_pos = f.tell()
-        ncmds = struct.unpack('<I', f.read(4))[0]
-        sizeofcmds_pos = f.tell()
-        sizeofcmds = struct.unpack('<I', f.read(4))[0]
-        f.read(8)
 
-        # Check if already injected
-        header_end = slice_offset + 32
-        f.seek(header_end)
+        f.seek(slice_offset + 16)
+        ncmds, sizeofcmds = struct.unpack('<II', f.read(8))
+        command_start = slice_offset + 32
+        f.seek(command_start)
+        commands = f.read(sizeofcmds)
+        if len(commands) != sizeofcmds:
+            raise RuntimeError('读取 Mach-O load commands 失败')
+
+        pos = 0
         already = False
-        for i in range(ncmds):
-            pos = f.tell()
-            cmd = struct.unpack('<I', f.read(4))[0]
-            cs = struct.unpack('<I', f.read(4))[0]
-            if cmd == 0xC:
-                no = struct.unpack('<I', f.read(4))[0]
-                f.seek(pos + no)
-                name = b''
-                while True:
-                    b = f.read(1)
-                    if b == b'\x00': break
-                    name += b
-                if b'WeChatAntiRevoke' in name:
-                    already = True
-                    break
-            f.seek(pos + cs)
+        code_signature_pos = None
+        first_section_offset = slice_size
+        for _ in range(ncmds):
+            if pos + 8 > sizeofcmds:
+                raise RuntimeError('Mach-O load commands 越界')
+            cmd, command_size = struct.unpack_from('<II', commands, pos)
+            if command_size < 8 or pos + command_size > sizeofcmds:
+                raise RuntimeError('Mach-O load command 大小非法')
+            if cmd == 0x1D:
+                code_signature_pos = pos
+            if cmd == 0x19 and command_size >= 72:
+                nsects = struct.unpack_from('<I', commands, pos + 64)[0]
+                if 72 + nsects * 80 > command_size:
+                    raise RuntimeError('Mach-O section 表越界')
+                for index in range(nsects):
+                    section = pos + 72 + index * 80
+                    section_size = struct.unpack_from('<Q', commands, section + 40)[0]
+                    section_offset = struct.unpack_from('<I', commands, section + 48)[0]
+                    flags = struct.unpack_from('<I', commands, section + 64)[0]
+                    if section_size and section_offset and flags & 0xff not in (1, 0xc, 0x12):
+                        first_section_offset = min(first_section_offset, section_offset)
+            if cmd == 0xC and command_size >= 24:
+                name_offset = struct.unpack_from('<I', commands, pos + 8)[0]
+                if 24 <= name_offset < command_size:
+                    name = commands[pos + name_offset:pos + command_size].split(b'\0', 1)[0]
+                    if name == target_name:
+                        already = True
+            pos += command_size
+        if pos != sizeofcmds:
+            raise RuntimeError('Mach-O sizeofcmds 与命令表不一致')
+
         if already:
             continue
 
-        insert_pos = slice_offset + 32 + sizeofcmds
-        lc = struct.pack('<I', 0xC)
-        lc += struct.pack('<I', cmd_size)
-        lc += struct.pack('<I', 24)
-        lc += struct.pack('<I', 2)
-        lc += struct.pack('<I', 0x10000)
-        lc += struct.pack('<I', 0x10000)
+        lc = struct.pack('<II', 0xC, cmd_size)
+        lc += struct.pack('<IIII', 24, 2, 0x10000, 0x10000)
         lc += dylib_name
-        while len(lc) < cmd_size:
-            lc += b'\x00'
+        lc += b'\x00' * (cmd_size - len(lc))
 
-        f.seek(insert_pos)
-        f.write(lc)
-        f.seek(ncmds_pos)
+        # LC_CODE_SIGNATURE 必须保持在 load commands 的最后；否则 codesign
+        # 会在重签名时丢掉刚追加的动态库依赖。
+        if code_signature_pos is None:
+            new_commands = commands + lc
+        else:
+            new_commands = (commands[:code_signature_pos] + lc +
+                            commands[code_signature_pos:])
+
+        if 32 + len(new_commands) > first_section_offset:
+            raise RuntimeError('Mach-O header 没有足够空隙，拒绝覆盖 section')
+        f.seek(command_start + sizeofcmds)
+        if f.read(cmd_size) != b'\0' * cmd_size:
+            raise RuntimeError('Mach-O header 扩展区域不是空白，拒绝覆盖')
+        plans.append((slice_offset, command_start, ncmds, sizeofcmds, new_commands))
+
+    if not plans:
+        raise RuntimeError('没有可注入的 arm64 Mach-O slice')
+
+    for slice_offset, command_start, ncmds, sizeofcmds, new_commands in plans:
+        f.seek(command_start)
+        f.write(new_commands)
+        f.seek(slice_offset + 16)
         f.write(struct.pack('<I', ncmds + 1))
-        f.seek(sizeofcmds_pos)
+        f.seek(slice_offset + 20)
         f.write(struct.pack('<I', sizeofcmds + cmd_size))
 
-print("ok")
+print('ok')
 INJECT_SCRIPT
 
     echo "[INFO] 注入完成"
 }
 
+make_hook_entitlements() {
+    local ent_file="$1"
+    local dumped=""
+
+    # 保留微信原始的 app-sandbox / application-identifier / application-groups
+    # 等配置，只在其上追加本地 hook 所需权限。直接用一个精简 plist 会让
+    # 微信失去原始沙盒身份，启动后立即退出。
+    dumped=$(codesign -d --entitlements :- "$WECHAT_BIN" 2>/dev/null)
+    printf '%s\n' "$dumped" | sed -n '/<?xml/,/<\/plist>/p' > "$ent_file"
+    if ! grep -F '<plist' "$ent_file" >/dev/null; then
+        echo "[ERROR] 无法读取微信原始 entitlements，拒绝使用空配置重签名"
+        return 1
+    fi
+    plutil -lint "$ent_file" >/dev/null
+
+    local key
+    for key in \
+        com.apple.security.cs.disable-library-validation \
+        com.apple.security.cs.allow-unsigned-executable-memory \
+        com.apple.security.get-task-allow; do
+        /usr/libexec/PlistBuddy -c "Set :$key true" "$ent_file" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :$key bool true" "$ent_file"
+    done
+}
+
 resign_app() {
-    echo "[INFO] 重签名（注入 entitlements 绕过 Library Validation）..."
+    echo "[INFO] 重签名（保留微信原始 entitlements，追加 hook 权限）..."
 
-    # 创建 entitlements 文件
-    # get-task-allow 允许 lldb attach（用于 monitor.sh 写消息缓存供撤回反查）
     local ENT_FILE="/tmp/antirevoke_ent.plist"
-    cat > "$ENT_FILE" << 'ENTITLEMENTS'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.cs.disable-library-validation</key>
-    <true/>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
-    <key>com.apple.security.get-task-allow</key>
-    <true/>
-</dict>
-</plist>
-ENTITLEMENTS
+    make_hook_entitlements "$ENT_FILE"
 
-    # 1. 签名 dylib（adhoc）
+    # 只重签新增 dylib、主程序和 bundle 本身，不 deep 重签腾讯的嵌套组件。
     codesign --force --sign - "$DYLIB_DST" 2>/dev/null
-
-    # 2. 整体 deep 签名（先处理所有子组件）
-    codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null
-
-    # 3. 最后单独给主程序签名并注入 entitlements（覆盖 deep 签名的结果）
-    #    这样 entitlements 不会被后续操作覆盖
     codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_BIN" 2>/dev/null
+    codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_APP" 2>/dev/null
 
-    # 清除 xattr（best-effort）
     xattr -cr "$WECHAT_APP" 2>/dev/null || true
 
-    # 验证 entitlements 是否注入成功
-    if codesign -d --entitlements - "$WECHAT_BIN" 2>&1 | grep -q "disable-library-validation"; then
-        echo "[INFO] 重签名完成（Library Validation 已禁用）"
+    if codesign -d --entitlements - "$WECHAT_BIN" 2>&1 | grep -F "disable-library-validation" >/dev/null; then
+        echo "[INFO] 重签名完成（原始 entitlements 已保留，Library Validation 已禁用）"
     else
         echo "[WARN] entitlements 可能未生效，请确认 SIP 状态"
     fi
@@ -871,98 +513,114 @@ ENTITLEMENTS
     rm -f "$ENT_FILE"
 }
 
+resign_main_with_entitlements() {
+    echo "[INFO] 注入后重签名主程序（保留原始 entitlements 和动态库依赖）..."
+
+    local ENT_FILE="/tmp/antirevoke_ent.plist"
+    make_hook_entitlements "$ENT_FILE"
+
+    codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_BIN" 2>/dev/null
+    # 只更新 bundle 的外层签名，不使用 --deep，避免再次改写主程序或腾讯组件。
+    codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_APP" 2>/dev/null
+    xattr -cr "$WECHAT_APP" 2>/dev/null || true
+
+    if codesign -d --entitlements - "$WECHAT_BIN" 2>&1 | grep -F "disable-library-validation" >/dev/null; then
+        echo "[INFO] 注入后重签名完成（Library Validation 已禁用）"
+    else
+        echo "[WARN] 注入后 entitlements 可能未生效，请确认 SIP 状态"
+    fi
+
+    rm -f "$ENT_FILE"
+}
+
+resign_clean_app() {
+    echo "[INFO] 重签名已恢复的微信..."
+    codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null
+    codesign --force --sign - "$WECHAT_BIN" 2>/dev/null
+    xattr -cr "$WECHAT_APP" 2>/dev/null || true
+}
+
 verify_install() {
-    echo "[INFO] 验证安装..."
+    echo "[INFO] 验证安装（必须确认当前进程 HOOK_READY）..."
+    codesign --verify --deep --strict "$WECHAT_APP"
+    codesign --verify --strict "$DYLIB_DST"
+    local arch
+    for arch in $(lipo -archs "$WECHAT_BIN"); do
+        if ! otool -arch "$arch" -L "$WECHAT_BIN" | grep -F "$DYLIB_INSTALL_NAME" >/dev/null; then
+            echo "[ERROR] $arch 架构没有防撤回依赖"
+            return 1
+        fi
+    done
 
-    local FAIL=0
-
-    # 1. dylib 文件存在
-    if [ ! -f "$DYLIB_DST" ]; then
-        echo "[ERROR] dylib 文件不存在: $DYLIB_DST"
-        FAIL=1
+    local started_at marker_required=0
+    if [ "$(uname -m)" = arm64 ] && xcrun dwarfdump --uuid \
+        "$WECHAT_APP/Contents/Resources/wechat.dylib" | grep -F \
+        '918FFBFD-E18D-363F-B07C-B8D7F1436727 (arm64)' >/dev/null; then
+        marker_required=1
     fi
-
-    # 2. LC_LOAD_DYLIB 注入成功
-    if ! otool -l "$WECHAT_BIN" 2>/dev/null | grep -q "WeChatAntiRevoke"; then
-        echo "[ERROR] LC_LOAD_DYLIB 未注入到主程序"
-        FAIL=1
-    fi
-
-    # 3. provenance 已清除
-    if xattr "$WECHAT_APP" 2>/dev/null | grep -q "com.apple.provenance"; then
-        echo "[WARN] WeChat.app 仍有 provenance 标记（重签名可能重新添加）"
-        xattr -d com.apple.provenance "$WECHAT_APP" 2>/dev/null || true
-    fi
-    if xattr "$WECHAT_BIN" 2>/dev/null | grep -q "com.apple.provenance"; then
-        echo "[WARN] 主程序仍有 provenance 标记"
-        xattr -d com.apple.provenance "$WECHAT_BIN" 2>/dev/null || true
-    fi
-    if xattr "$DYLIB_DST" 2>/dev/null | grep -q "com.apple.provenance"; then
-        echo "[WARN] dylib 仍有 provenance 标记"
-        xattr -d com.apple.provenance "$DYLIB_DST" 2>/dev/null || true
-    fi
-
-    # 4. 签名验证
-    if ! codesign -v "$DYLIB_DST" 2>/dev/null; then
-        echo "[ERROR] dylib 签名无效"
-        FAIL=1
-    fi
-    if ! codesign -v "$WECHAT_BIN" 2>/dev/null; then
-        echo "[ERROR] 主程序签名无效"
-        FAIL=1
-    fi
-
-    # 5. 运行时加载测试（启动微信、等待后检查 dylib 是否在内存中）
-    echo "[INFO] 启动微信进行加载验证（约 8 秒）..."
+    started_at=$(date '+%Y-%m-%d %H:%M:%S')
     open "$WECHAT_APP"
-    sleep 8
-
-    local PID=$(pgrep -x WeChat 2>/dev/null)
-    if [ -z "$PID" ]; then
-        echo "[ERROR] 微信未能启动"
-        FAIL=1
-    else
-        if vmmap "$PID" 2>/dev/null | grep -q "AntiRevoke"; then
-            echo "[INFO] dylib 已成功加载到微信进程"
-        else
-            echo "[ERROR] dylib 未加载到微信进程！可能原因："
-            echo "        - macOS 安全策略阻止"
-            echo "        - 签名不一致"
-            FAIL=1
+    local PID="" start=$SECONDS output=""
+    while [ $((SECONDS - start)) -lt 30 ]; do
+        PID=$(pgrep -x WeChat 2>/dev/null | head -n 1 || true)
+        if [ -n "$PID" ]; then
+            # 系统日志只包含本插件主动发布的非敏感状态，无需读取受保护的微信数据。
+            output=$(/usr/bin/log show --start "$started_at" --style compact \
+                --predicate "processIdentifier == $PID AND subsystem == \"local.WeChatIntercept\"" 2>/dev/null) || {
+                echo "[ERROR] 无法读取系统 hook 状态日志"
+                return 1
+            }
+            if printf '%s\n' "$output" | grep -F 'ERROR:' >/dev/null; then
+                printf '%s\n' "$output"
+                echo "[ERROR] hook 初始化失败"
+                return 1
+            fi
+            if printf '%s\n' "$output" | grep -F 'HOOK_READY' >/dev/null; then
+                if [ "$marker_required" -eq 1 ] && ! printf '%s\n' "$output" | grep -F 'MARKER_READY' >/dev/null; then
+                    sleep 1
+                    continue
+                fi
+                sleep 2
+                if kill -0 "$PID" 2>/dev/null && vmmap "$PID" 2>/dev/null | grep -F 'WeChatAntiRevoke.dylib' >/dev/null; then
+                    printf '%s\n' "$output"
+                    echo "[INFO] 当前微信进程 hook 已初始化并通过加载验证"
+                    return 0
+                fi
+                echo "[ERROR] hook 初始化后微信未持续正常运行"
+                return 1
+            fi
         fi
+        sleep 1
+    done
+    echo "[ERROR] 30 秒内未确认当前进程 HOOK_READY，不保留未验证的安装"
+    echo "[INFO] 日志路径: $HOOK_LOG"
+    if [ -n "$PID" ]; then
+        sample "$PID" 1 1 -file "/private/tmp/WeChatIntercept-startup.$PID.sample.txt" >/dev/null 2>&1 || true
     fi
+    return 1
+}
 
-    # 6. 检查 hook 安装日志（/tmp/antirevoke_debug.log）
-    local LOG_FILE="/tmp/antirevoke_debug.log"
-    if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
-        local LOG_OUTPUT=$(cat "$LOG_FILE")
-        if echo "$LOG_OUTPUT" | grep -q "trampoline 安装完成"; then
-            echo "[INFO] Hook 安装成功（trampoline 已写入）"
-        elif echo "$LOG_OUTPUT" | grep -q "slot 写入完成"; then
-            echo "[INFO] Hook 安装成功（slot 方式）"
-        elif echo "$LOG_OUTPUT" | grep -q "写入验证失败"; then
-            echo "[ERROR] trampoline 写入验证失败"
-            FAIL=1
-        elif echo "$LOG_OUTPUT" | grep -q "make_rw 失败"; then
-            echo "[ERROR] 代码页写入被系统拒绝（vm_protect 失败）"
-            FAIL=1
-        elif echo "$LOG_OUTPUT" | grep -q "未找到 wechat.dylib"; then
-            echo "[ERROR] 未找到 wechat.dylib"
-            FAIL=1
-        elif echo "$LOG_OUTPUT" | grep -q "均未匹配\|hook 失败"; then
-            echo "[ERROR] hook 安装失败"
-            FAIL=1
+rollback_install() {
+    local status=${1:-$?}
+    trap - ERR INT TERM
+    set +e
+    if [ "$INSTALL_SWAPPED" -eq 1 ]; then
+        WECHAT_APP="$INSTALL_LIVE_APP"
+        WECHAT_BIN="$WECHAT_APP/Contents/MacOS/WeChat"
+        DYLIB_DST="$WECHAT_APP/Contents/Resources/WeChatAntiRevoke.dylib"
+        echo "[ERROR] 安装未完成，恢复安装前的完整应用..."
+        kill_wechat
+        if [ -d "$WECHAT_APP" ]; then
+            mv "$WECHAT_APP" "${INSTALL_PREVIOUS_APP%.app}.failed.app" || exit "$status"
         fi
+        mv "$INSTALL_PREVIOUS_APP" "$WECHAT_APP" || exit "$status"
+        codesign --verify --deep --strict "$WECHAT_APP" || exit "$status"
+        echo "[INFO] 已恢复安装前的应用与签名，未修改聊天数据"
+        open "$WECHAT_APP"
     else
-        echo "[WARN] hook 日志文件未生成，hook_init 可能尚未执行"
+        echo "[ERROR] 临时副本准备失败，当前微信未被替换"
     fi
-    echo "[INFO] 调试日志: cat /tmp/antirevoke_debug.log"
-
-    if [ "$FAIL" -ne 0 ]; then
-        echo ""
-        echo "[WARN] 安装验证未完全通过，请检查上述错误"
-        echo ""
-    fi
+    exit "$status"
 }
 
 do_install() {
@@ -974,17 +632,52 @@ do_install() {
         echo "[INFO] 检测到已安装，将重新安装..."
     fi
 
-    kill_wechat
+    trap rollback_install ERR
+    trap 'rollback_install 130' INT
+    trap 'rollback_install 143' TERM
 
-    # 无条件清除 provenance（即使 .app 顶层无标记，内层文件也可能有）
-    # 重打包是幂等操作，不会造成损坏
-    remove_provenance
-    rm -f "$DYLIB_DST" 2>/dev/null || true
+    # 在任何重签名或 xattr 处理之前保存完整原始 app，卸载时可恢复原始
+    # Developer ID 签名；仅保存主程序不足以恢复嵌套组件的签名状态。
+    backup_original_app
 
+    # 在独立副本编译、注入、签名并验签；失败不会破坏正在运行的微信。
+    local stage_dir stage_app
+    stage_dir=$(mktemp -d /private/tmp/WeChatIntercept-install.XXXXXX)
+    stage_app="$stage_dir/WeChat.app"
+    ditto --rsrc --noqtn --acl "$ORIGINAL_APP" "$stage_app"
+    WECHAT_APP="$stage_app"
+    WECHAT_BIN="$WECHAT_APP/Contents/MacOS/WeChat"
+    DYLIB_DST="$WECHAT_APP/Contents/Resources/WeChatAntiRevoke.dylib"
+    remove_injected_load_command
     compile_dylib
     inject_dylib
     resign_app
+    codesign --verify --deep --strict "$WECHAT_APP"
+
+    WECHAT_APP="$INSTALL_LIVE_APP"
+    WECHAT_BIN="$WECHAT_APP/Contents/MacOS/WeChat"
+    DYLIB_DST="$WECHAT_APP/Contents/Resources/WeChatAntiRevoke.dylib"
+    kill_wechat
+    if pgrep -x WeChat >/dev/null 2>&1; then
+        echo "[ERROR] 微信仍在运行，拒绝替换应用"
+        return 1
+    fi
+    INSTALL_PREVIOUS_APP="$stage_dir/WeChat.previous.app"
+    mv "$WECHAT_APP" "$INSTALL_PREVIOUS_APP"
+    INSTALL_SWAPPED=1
+    mv "$stage_app" "$WECHAT_APP"
     verify_install
+    INSTALL_SWAPPED=0
+    trap - ERR INT TERM
+
+    # 验证成功后，临时目录里只剩安装前的已修改应用。原始签名整包已经
+    # 保存在 ORIGINAL_APP，无需在 /private/tmp 再保留一份完整副本。
+    if ! rm -rf "$INSTALL_PREVIOUS_APP"; then
+        echo "[WARN] 安装已成功，但无法删除临时应用副本: $INSTALL_PREVIOUS_APP"
+    elif ! rmdir "$stage_dir"; then
+        echo "[WARN] 安装已成功，但临时目录仍有其他内容: $stage_dir"
+    fi
+    INSTALL_PREVIOUS_APP=""
 
 
 
@@ -996,7 +689,7 @@ do_install() {
     echo " 功能: 对方撤回的消息将保留可见"
     echo "       自己撤回消息正常工作"
      echo ""
-     echo " 卸载: $0 --uninstall"
+    echo " 卸载: $0 --uninstall"
     echo ""
 }
 
@@ -1061,25 +754,51 @@ do_uninstall() {
     print_banner
     echo "[INFO] 卸载防撤回插件..."
 
+    if [ ! -d "$WECHAT_APP" ] || [ ! -f "$WECHAT_BIN" ]; then
+        echo "[ERROR] 未找到完整的微信安装: $WECHAT_APP"
+        exit 1
+    fi
+    VERSION=$(defaults read "$WECHAT_APP/Contents/Info.plist" CFBundleVersion 2>/dev/null || true)
+
+    local was_patched=0
+    if [ -f "$DYLIB_DST" ] || has_injected_load_command; then
+        was_patched=1
+    fi
+    if [ "$was_patched" -eq 0 ]; then
+        echo "[INFO] 当前微信没有 WeChatIntercept 修改，无需重签名或恢复"
+        return 0
+    fi
+
     kill_wechat
 
-    # 删除 dylib
-    rm -f "$DYLIB_DST" 2>/dev/null || true
-
-    # 重新安装微信是最干净的卸载方式
-    echo "[INFO] 建议重新安装微信以完全恢复原始状态"
-    echo "[INFO] 或者删除 $DYLIB_DST 并重新签名"
-
-    if [ -f "$DYLIB_DST" ]; then
-        echo "[WARN] 无法删除 dylib，请手动重新安装微信"
+    # 优先恢复安装时保存的完整原始 app；旧版本没有整包备份时，退回到
+    # 移除 load command + 主程序备份的兼容路径。
+    if restore_original_app; then
+        :
     else
-        resign_app 2>/dev/null || true
-        echo ""
-        echo "=============================="
-        echo " 已卸载（dylib 已删除）"
-        echo " 建议重新安装微信以彻底恢复"
-        echo "=============================="
+        if restore_original_binary; then
+            echo "[INFO] 已恢复微信主程序备份"
+        else
+            remove_injected_load_command
+        fi
+        rm -f "$DYLIB_DST" 2>/dev/null || true
+
+        if [ -f "$DYLIB_DST" ]; then
+            echo "[ERROR] 无法删除 dylib，请手动重新安装微信"
+            exit 1
+        fi
+
+        resign_clean_app
+        if has_injected_load_command; then
+            echo "[ERROR] 卸载失败：主程序仍保留 WeChatAntiRevoke 加载命令"
+            exit 1
+        fi
     fi
+
+    echo ""
+    echo "=============================="
+    echo " 已卸载，微信已恢复为无防撤回状态"
+    echo "=============================="
     echo ""
 }
 
@@ -1816,7 +1535,14 @@ do_monitor_status() {
 }
 
 # ======================== 入口 ========================
+# 允许回归测试只载入函数定义，不触发安装或关闭微信。
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
 case "${1:-}" in
+    --install|-i)
+        do_install
+        ;;
     --debug|-d)
         do_debug
         ;;
@@ -1839,6 +1565,7 @@ case "${1:-}" in
         print_banner
         echo "用法:"
         echo "  $0                     安装防撤回"
+        echo "  $0 --install           安装防撤回"
         echo "  $0 --monitor-install   安装消息监听（后台自动运行）"
         echo "  $0 --monitor-uninstall 卸载消息监听"
         echo "  $0 --monitor-status    查看监听状态"

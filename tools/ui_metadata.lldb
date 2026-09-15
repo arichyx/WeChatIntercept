@@ -1,0 +1,4 @@
+expression -l objective-c++ -- @import AppKit
+expression -l objective-c++ -- @import ObjectiveC
+expression -l objective-c++ -O -- ({ NSMutableString *result = [NSMutableString string]; __block void (^visit)(NSView *, int); visit = ^(NSView *view, int depth) { if (depth > 10) return; [result appendFormat:@"%@%s %p [%.0f %.0f %.0f %.0f]\n", [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0], object_getClassName(view), view, view.frame.origin.x, view.frame.origin.y, view.frame.size.width, view.frame.size.height]; for (NSView *child in view.subviews) visit(child, depth + 1); }; for (NSWindow *window in NSApp.windows) { if (window.isVisible) { [result appendFormat:@"WINDOW %s %p\n", object_getClassName(window), window]; visit(window.contentView, 0); } } visit = nil; result; })
+process detach

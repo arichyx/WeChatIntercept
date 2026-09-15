@@ -1,0 +1,5 @@
+command script import tools/qt_recall_probe.py
+breakpoint set --name hook_isRevokeMessage
+breakpoint command add -F qt_recall_probe.on_revoke 1
+process continue
+process detach

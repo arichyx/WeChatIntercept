@@ -1,0 +1,12 @@
+expression -l objective-c++ -- @import AppKit
+expression -l objective-c++ -- @import ObjectiveC
+expression -l objective-c++ -- @import Darwin
+expression -l objective-c++ -- uintptr_t $arPlatform = ({ uintptr_t arPlatformValue = 0; Class arQNSClass = NSClassFromString(@"QNSView"); for (NSWindow *arWindow in NSApp.windows) { NSView *arView = arWindow.contentView; if (arWindow.isVisible && [arView isKindOfClass:arQNSClass]) arPlatformValue = (uintptr_t)((void *(*)(id, SEL))objc_msgSend)(arView, sel_getUid("platformWindow")); } arPlatformValue; })
+expression -l objective-c++ -f hex -- $arPlatform
+memory read --format x --size 8 --count 8 $arPlatform
+disassemble --start-address `*(uintptr_t *)(*(uintptr_t *)$arPlatform)` --count 20
+expression -l objective-c++ -- uintptr_t $arQtWindow = *(uintptr_t *)($arPlatform + 24) - 16
+expression -l objective-c++ -f hex -- $arQtWindow
+memory read --format x --size 8 --count 8 $arQtWindow
+disassemble --start-address `*(uintptr_t *)(*(uintptr_t *)$arQtWindow)` --count 20
+process detach
