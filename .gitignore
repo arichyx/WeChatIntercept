@@ -64,3 +64,6 @@ iOSInjectionProject/
 
 # Local WeChat binary used during reverse-engineering experiments; do not commit.
 /WeChat
+
+# macOS Finder metadata.
+.DS_Store
