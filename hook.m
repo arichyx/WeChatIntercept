@@ -124,7 +124,11 @@ static _Bool read_bytes(uintptr_t addr, void *out, size_t len) {
         (mach_vm_address_t)out, &copied) == KERN_SUCCESS && copied == len;
 }
 
+// stickers.h 的微信 4 Qt 菜单适配器在本文件后面定义的通用跳板上安装钩子。
+static _Bool install_arm64_trampoline(uintptr_t func_addr, uintptr_t hook_addr);
+
 #include "markers.h"
+#include "stickers.h"
 
 // 入口：被微信 isRevokeMessage 替换。
 // 返回 1 = 该消息是撤回（按原行为处理）；返回 0 = 阻止微信删除消息
@@ -460,24 +464,24 @@ static kern_return_t make_rx(uintptr_t addr, size_t len) {
                       VM_PROT_READ | VM_PROT_EXECUTE);
 }
 
-// arm64: LDR X16,#8; BR X16; <addr64>; NOP  — 共 20 字节覆盖原函数入口
+// Exactly 16 bytes: gateways replay four instructions and resume at +16.
+// An extra NOP at +16 would erase the first unreplayed instruction.
 static _Bool install_arm64_trampoline(uintptr_t func_addr, uintptr_t hook_addr) {
-    kern_return_t kr = make_rw(func_addr, 20);
+    kern_return_t kr = make_rw(func_addr, 16);
     if (kr != KERN_SUCCESS) { ARLOG("ERROR: make_rw kr=%d", kr); return 0; }
 
     uint32_t *p = (uint32_t *)func_addr;
     p[0] = 0x58000050u;  // LDR X16, #8
     p[1] = 0xD61F0200u;  // BR X16
     *(uint64_t *)(func_addr + 8) = (uint64_t)hook_addr;
-    p[4] = 0xD503201Fu;  // NOP
 
     // 回读验证
     if (*(volatile uint32_t *)func_addr != 0x58000050u) {
         ARLOG("ERROR: 写入验证失败"); return 0;
     }
 
-    sys_icache_invalidate((void *)func_addr, 20);
-    kr = make_rx(func_addr, 20);
+    sys_icache_invalidate((void *)func_addr, 16);
+    kr = make_rx(func_addr, 16);
     if (kr != KERN_SUCCESS) { ARLOG("ERROR: make_rx kr=%d", kr); return 0; }
     return 1;
 }
@@ -578,6 +582,7 @@ static void try_install_hook(unsigned attempt) {
     func_addr = scan_isRevokeMessage_arm64(text_start, text_size);
     if (func_addr) {
         ar_marker_start(header, slide);
+        if (gARMarkerReady) ar_sticker_start(header, slide);
         installed = install_arm64_trampoline(func_addr, (uintptr_t)&hook_isRevokeMessage);
     }
 #elif defined(__x86_64__)

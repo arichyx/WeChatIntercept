@@ -9,11 +9,17 @@ bash -n "$TEST_REPO/patch.sh"
 clang -arch arm64 -arch x86_64 -fobjc-arc -fsyntax-only -x objective-c \
     "$TEST_REPO/hook.m" -Wno-incompatible-pointer-types
 clang -fobjc-arc -framework Foundation -framework AppKit -Wno-incompatible-pointer-types \
+    -framework ImageIO -framework CoreGraphics \
     "$TEST_REPO/tests/hook_test.m" -o "$TEST_TMP/hook_test"
 "$TEST_TMP/hook_test"
 clang -fobjc-arc -framework Foundation -framework AppKit -Wno-incompatible-pointer-types \
+    -framework ImageIO -framework CoreGraphics \
     "$TEST_REPO/tests/marker_test.m" -o "$TEST_TMP/marker_test"
 "$TEST_TMP/marker_test"
+clang -fobjc-arc -framework Foundation -framework AppKit -lsqlite3 -Wno-incompatible-pointer-types \
+    -framework ImageIO -framework CoreGraphics \
+    "$TEST_REPO/tests/sticker_metadata_test.m" -o "$TEST_TMP/sticker_metadata_test"
+"$TEST_TMP/sticker_metadata_test"
 
 # 只对临时主程序副本做双架构往返测试，不签名或触碰实际应用。
 TEST_ORIGINAL="/Applications/WeChat.app/Contents/MacOS/WeChat"

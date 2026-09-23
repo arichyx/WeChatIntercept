@@ -2,7 +2,79 @@
 #include "../hook.m"
 #include <assert.h>
 
+#if defined(__arm64__)
+// The fifth instruction saves x19/x20. A 20-byte detour with a 16-byte
+// gateway silently skips it and corrupts the caller after the function returns.
+__attribute__((naked, noinline)) static int step_fixture(void) {
+    __asm__ volatile(
+        "stp x28, x27, [sp, #-0x60]!\n"
+        "stp x26, x25, [sp, #0x10]\n"
+        "stp x24, x23, [sp, #0x20]\n"
+        "stp x22, x21, [sp, #0x30]\n"
+        "stp x20, x19, [sp, #0x40]\n"
+        "stp x29, x30, [sp, #0x50]\n"
+        "add x29, sp, #0x50\n"
+        "mov x19, #0x55\n"
+        "mov x20, #0x66\n"
+        "mov w0, #100\n"
+        "ldp x29, x30, [sp, #0x50]\n"
+        "ldp x20, x19, [sp, #0x40]\n"
+        "ldp x22, x21, [sp, #0x30]\n"
+        "ldp x24, x23, [sp, #0x20]\n"
+        "ldp x26, x25, [sp, #0x10]\n"
+        "ldp x28, x27, [sp], #0x60\n"
+        "ret\n");
+}
+
+static int (*step_gateway)(void);
+static int step_hook(void) { return step_gateway(); }
+
+__attribute__((naked, noinline)) static int saved_registers_survive(void *function) {
+    __asm__ volatile(
+        "stp x20, x19, [sp, #-0x20]!\n"
+        "stp x29, x30, [sp, #0x10]\n"
+        "add x29, sp, #0x10\n"
+        "mov x16, x0\n"
+        "mov x19, #0x123\n"
+        "mov x20, #0x456\n"
+        "blr x16\n"
+        "cmp w0, #100\n"
+        "cset w9, eq\n"
+        "cmp x19, #0x123\n"
+        "cset w0, eq\n"
+        "and w0, w0, w9\n"
+        "cmp x20, #0x456\n"
+        "cset w1, eq\n"
+        "and w0, w0, w1\n"
+        "ldp x29, x30, [sp, #0x10]\n"
+        "ldp x20, x19, [sp], #0x20\n"
+        "ret\n");
+}
+
+static void test_resuming_trampoline(void) {
+    size_t size = (size_t)getpagesize();
+    uint8_t *code = mmap(NULL, size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANON, -1, 0);
+    assert(code != MAP_FAILED);
+    memcpy(code, (void *)step_fixture, 17 * sizeof(uint32_t));
+    memcpy(code + 128, code, 16);
+    uint32_t fifth;
+    memcpy(&fifth, code + 16, sizeof(fifth));
+    assert(fifth == 0xa9044ff4);
+    assert(install_arm64_trampoline((uintptr_t)code + 144, (uintptr_t)code + 16));
+    step_gateway = (int (*)(void))(code + 128);
+    assert(saved_registers_survive(code));
+    assert(install_arm64_trampoline((uintptr_t)code, (uintptr_t)step_hook));
+    assert(saved_registers_survive(code));
+    assert(!memcmp(code + 16, &fifth, sizeof(fifth)));
+    munmap(code, size);
+}
+#endif
+
 int main(void) {
+#if defined(__arm64__)
+    test_resuming_trampoline();
+#endif
     const uint32_t arm_pattern[] = {
         0xB9400C08u, 0x5284E249u, 0x6B09011Fu, 0x1A9F17E0u, 0xD65F03C0u
     };

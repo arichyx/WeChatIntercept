@@ -338,6 +338,7 @@ compile_dylib() {
     SRC_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hook.m"
 
     clang -arch arm64 -arch x86_64 -fobjc-arc -shared -framework Foundation -framework AppKit \
+        -framework ImageIO -framework CoreGraphics \
         -o "$DYLIB_DST" \
         -install_name "$DYLIB_INSTALL_NAME" \
         "$SRC_FILE" 2>&1
@@ -576,9 +577,13 @@ verify_install() {
                 return 1
             fi
             if printf '%s\n' "$output" | grep -F 'HOOK_READY' >/dev/null; then
-                if [ "$marker_required" -eq 1 ] && ! printf '%s\n' "$output" | grep -F 'MARKER_READY' >/dev/null; then
-                    sleep 1
-                    continue
+                if [ "$marker_required" -eq 1 ]; then
+                    if ! printf '%s\n' "$output" | grep -F 'MARKER_READY' >/dev/null || \
+                       ! printf '%s\n' "$output" | grep -F 'STICKER_EXPORT_QT_READY' >/dev/null || \
+                       ! printf '%s\n' "$output" | grep -F 'STICKER_METADATA_HOOK_READY' >/dev/null; then
+                        sleep 1
+                        continue
+                    fi
                 fi
                 sleep 2
                 if kill -0 "$PID" 2>/dev/null && vmmap "$PID" 2>/dev/null | grep -F 'WeChatAntiRevoke.dylib' >/dev/null; then
