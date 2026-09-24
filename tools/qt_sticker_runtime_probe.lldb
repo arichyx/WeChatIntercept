@@ -1,0 +1,4 @@
+# Load from the repository root; this file only registers the command.
+# Run explicitly: sticker-runtime-probe
+# See tools/README.md for attach, imports, output and detach instructions.
+command script import tools/qt_sticker_runtime_probe.py

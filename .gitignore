@@ -67,3 +67,8 @@ iOSInjectionProject/
 
 # macOS Finder metadata.
 .DS_Store
+
+# Python diagnostic tools.
+__pycache__/
+*.pyc
+*.pyo

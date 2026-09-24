@@ -1,0 +1,4 @@
+# Load from the repository root; this file only registers the command.
+# Run explicitly: emoticon-meta-probe [Qt class name]
+# See tools/README.md for attach, imports, output and detach instructions.
+command script import tools/qt_emoticon_meta_probe.py

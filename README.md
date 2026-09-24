@@ -139,6 +139,8 @@ cat /tmp/wechat_monitor_daemon.log    # 查看消息监听日志
 ./patch.sh --monitor   # 前台运行消息监听（Ctrl+C 退出）
 ```
 
+表情诊断和机器码分析工具的用法见 [tools/README.md](tools/README.md)。
+
 ---
 
 ## 风险说明
